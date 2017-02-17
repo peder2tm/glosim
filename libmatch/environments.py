@@ -24,6 +24,7 @@ class alchemy:
           elif sa>sb and (sb,sa) in self.rules:
              return self.rules[(sb,sa)] 
           else: 
+             print "Missing alchemy rule for %d, %d" % (sa, sb)
              if sa==sb: return 1
              else: return 0  
    
@@ -157,37 +158,32 @@ def envk(envA, envB, alchem=alchemy()):
                ndot = np.dot(envA.getpair(s1,s2), envB.getpair(s1,s2))
                dotp+=ndot
    else:
-       #union of atom kinds present in the two environments   
-       zspecies = sorted(list(set(envA.zspecies+envB.zspecies)))
-       nsp = len(zspecies)
+      #union of atom kinds present in the two environments   
+      zspecies = sorted(list(set(envA.zspecies+envB.zspecies)))
+      nsp = len(zspecies)
     
-       # alchemical matrix for species
-       alchemAB = np.zeros((nsp,nsp), float)
-       for sA in xrange(nsp):
-           for sB in xrange(sA+1):
-               alchemAB[sA,sB] = alchem.getpair(zspecies[sB],zspecies[sA])
-               alchemAB[sB,sA] = alchemAB[sA,sB]
+      # alchemical matrix for species
+      alchemAB = np.zeros((nsp,nsp), float)
+      for sA in xrange(nsp):
+         for sB in xrange(sA+1):
+            alchemAB[sA,sB] = alchem.getpair(zspecies[sB],zspecies[sA])
+            alchemAB[sB,sA] = alchemAB[sA,sB]
                
-       # prepares the lists of pairs to avoid calling many times getpair further down the line
-       eB = []
-       for iB1 in xrange(nsp):
-           sB1 = zspecies[iB1]
-           eB.append([])
-           for iB2 in xrange(nsp):
-               sB2 = zspecies[iB2] 
-               eB[iB1].append(envB.getpair(sB1,sB2))
-        
-       for iA1 in xrange(nsp):
-          sA1 = zspecies[iA1]
-          for iA2 in xrange(nsp):
-             sA2 = zspecies[iA2] 
-             eA = envA.getpair(sA1, sA2)                
-             for iB1 in xrange(nsp):          
-                if alchemAB[iA1,iB1] == 0.0: continue
-                sB1 = zspecies[iB1]
-                for iB2 in xrange(nsp):                              
-                    if alchemAB[iA2,iB2] == 0.0: continue
-                    sB2 = zspecies[iB2]
-                    dotp += np.dot(eA, eB[iB1][iB2]) * alchemAB[iA1,iB1] * alchemAB[iA2,iB2]
+      # prepares the lists of pairs to avoid calling many times getpair further down the line
+      for i1 in xrange(nsp):
+         s1 = zspecies[i1] 
+         for i2 in xrange(nsp):
+            s2 = zspecies[i2] 
+            a=envA.getpair(s1,s2)
+            b=envB.getpair(s1,s2)
+            if i1==0 and i2==0:
+               arrA = np.empty((nsp, nsp, a.shape[0]), float)
+               arrB = np.empty((nsp, nsp, a.shape[0]), float)
+            arrA[i1,i2,:] = a
+            arrB[i1,i2,:] = b
+
+      dotprod = np.tensordot(arrA, arrB, axes=([2],[2]))
+      dotprod = np.tensordot(dotprod, alchemAB, axes=([1,3],[0,1]))
+      dotp = np.tensordot(dotprod, alchemAB, axes=([0,1],[0,1]))
    
    return dotp

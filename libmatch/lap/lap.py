@@ -1,5 +1,7 @@
 #!/usr/bin/python
 import numpy as np
+import scipy as sp
+import scipy.optimize
 import sys, time
 from copy import copy
 
@@ -15,8 +17,12 @@ try:
             pair.append([x,assign[0][x]])
         return pair
 except:
-    from munkres import linear_assignment
+    #from munkres import linear_assignment
     print >> sys.stderr, "WARNING! fast hungarian library is not available \n"  
+    def linear_assignment(matrix):
+        row_ind, col_ind = scipy.optimize.linear_sum_assignment(matrix)
+        return np.stack([row_ind, col_ind], axis=1)
+
 def best_pairs(matrix):
     return linear_assignment(matrix)
 
