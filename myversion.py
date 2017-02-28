@@ -1,4 +1,5 @@
 import quippy
+import time
 import os
 import numpy as np
 import cPickle as pickle
@@ -7,6 +8,8 @@ import itertools
 import gzip
 from permanent import rematch
 from collections import defaultdict
+import multiprocessing
+import Queue
 
 def convert(nmax, lmax, nspecies, rawsoap):
     """ Converts from flat quippy SOAP format to a multidimensional array representation
@@ -17,23 +20,23 @@ def convert(nmax, lmax, nspecies, rawsoap):
     idx_soap = 0
     isqrttwo = 1.0/np.sqrt(2.0)
     for s1 in xrange(nspecies):
-        for n1 in xrange(nmax):         
+        for n1 in xrange(nmax):
             for s2 in xrange(s1+1):
-                for n2 in xrange(nmax if s2<s1 else n1+1): 
+                for n2 in xrange(nmax if s2<s1 else n1+1):
                     for l in xrange(lmax+1):
                         if (s1 != s2):
                             # multiplication by isqrttwo undo the normalisation
                             soaps[s2, s1, l+(lmax+1)*(n2+nmax*n1)] = rawsoap[idx_soap] * isqrttwo
                             soaps[s1, s2, l+(lmax+1)*(n1+nmax*n2)] = rawsoap[idx_soap] * isqrttwo
-                        else: 
-                            # diagonal species (s1=s2) have only half of the elements.          
+                        else:
+                            # diagonal species (s1=s2) have only half of the elements.
                             # TODO: PBJ: I don't know why this is the case?
                             # this is tricky. we need to duplicate diagonal blocks "repairing" these to be full.
-                            # this is necessary to enable alchemical similarity matching, where we need to combine 
+                            # this is necessary to enable alchemical similarity matching, where we need to combine
                             # alpha-alpha and alpha-beta environment fingerprints
                             val = rawsoap[idx_soap] * (1 if n1==n2 else isqrttwo)
                             soaps[s2, s1, l+(lmax+1)*(n2+nmax*n1)] = val
-                            soaps[s2, s1, l+(lmax+1)*(n1+nmax*n2)] = val                                         
+                            soaps[s2, s1, l+(lmax+1)*(n1+nmax*n2)] = val
                         idx_soap += 1
     return soaps
 
@@ -104,13 +107,13 @@ def kernel(a, b, alchem, gamma=0.5):
 
     for env_idx in range(nenv):
         sp_idx, atm_idx = idx_to_spec[env_idx]
-        # Missing atoms are set to isolated species 
+        # Missing atoms are set to isolated species
         # TODO: Not sure why we set them to 1?
-        arrA[env_idx, sp_idx, sp_idx, 0] = 1
-        arrB[env_idx, sp_idx, sp_idx, 0] = 1
+        #arrA[env_idx, sp_idx, sp_idx, 0] = 1
+        #arrB[env_idx, sp_idx, sp_idx, 0] = 1
 
-    map_array(a.envs, arrA, a.species, union_species) 
-    map_array(b.envs, arrB, b.species, union_species) 
+    map_array(a.envs, arrA, a.species, union_species)
+    map_array(b.envs, arrB, b.species, union_species)
 
     # alchemical matrix for species
     alchemAB = np.zeros((nsp,nsp), float)
@@ -120,10 +123,16 @@ def kernel(a, b, alchem, gamma=0.5):
             alchemAB[sB,sA] = alchemAB[sA,sB]
 
     kk = tensordot(arrA, arrB, alchemAB)
-    print kk
 
     return rematch(kk, gamma, 1e-6)
 
+class PickableMol():
+    """ Contains the necessary attributes from SoapMol to compute kernel.
+        This object must be pickable to be sent through the multiprocessing
+        queue. """
+    def __init__(self, soapmol):
+        self.species = soapmol.species
+        self.envs = soapmol.envs
 
 class SoapMol():
     def __init__(self, alchem_rules, atoms):
@@ -152,7 +161,7 @@ class SoapMol():
             self.envs[i] *= 1.0/norm
 
     #def _get_environments(self, atoms, coff=3.0, cotw=0.5, nmax=8, lmax=6, gs=0.5, cw=1.0):
-    def _get_environments(self, atoms, coff=5.0, cotw=0.5, nmax=10, lmax=10, gs=0.5, cw=1.0):
+    def _get_environments(self, atoms, coff=4.0, cotw=0.5, nmax=10, lmax=8, gs=0.5, cw=0.0):
         """ Compute environments for each atom
         Returns tuple consisting of
         a) Dictionary giving number of atoms for a given species
@@ -178,9 +187,10 @@ class SoapMol():
 
         for sp in sorted(species.keys()):
             # Create descriptor for current species
-            quippy_str = "soap central_weight="+str(cw)+"  covariance_sigma0=0.0 atom_sigma="+str(gs)+" cutoff="+str(coff)+" cutoff_transition_width="+str(cotw)+" n_max="+str(nmax)+" l_max="+str(lmax)+' '+lspecies+' Z='+str(sp)
-            desc = quippy.descriptors.Descriptor(quippy_str)   
-            
+            #quippy_str = "soap central_weight="+str(cw)+"  covariance_sigma0=0.0 atom_sigma="+str(gs)+" cutoff="+str(coff)+" cutoff_transition_width="+str(cotw)+" n_max="+str(nmax)+" l_max="+str(lmax)+' '+lspecies+' Z='+str(sp)
+            quippy_str = "soap central_weight="+str(cw)+"  covariance_sigma0=0.0 atom_sigma="+str(gs)+" cutoff="+str(coff)+" cutoff_transition_width="+str(cotw)+" n_max="+str(nmax)+" l_max="+str(lmax)+' '+lspecies+' Z='+str(sp)+' xml_version=0'
+            desc = quippy.descriptors.Descriptor(quippy_str)
+
             # Create output array
             psp = quippy.fzeros((desc.dimensions(),desc.descriptor_sizes(at)[0]))
             # Compute power spectrum
@@ -208,12 +218,21 @@ class SoapMol():
 
         return species, outarray
 
+def worker(job_queue, res_queue, alchem_rules):
+    while 1:
+        try:
+            row, col, mola, molb = job_queue.get(True, 1)
+        except Queue.Empty:
+            return True
+        res = kernel(mola, molb, alchem_rules)
+        res_queue.put((row, col, res))
 
 def main():
     with open("alchemy.pickle","rb") as alchem_file:
         alchem_rules = pickle.load(alchem_file)
-    from collections import defaultdict
-    alchem_rules = defaultdict(lambda: 1)
+    #from collections import defaultdict
+    #alchem_rules = defaultdict(lambda: 1) # TODO: WARNING. Using 1 as alchem rule
+    #print "ALCHEM RULES ARE 1"
 
     xyz_file = sys.argv[1]
     kernel_file = os.path.splitext(xyz_file)[0] + ".k.pkz"
@@ -222,25 +241,78 @@ def main():
     all_mols = quippy.AtomsList(xyz_file)
 
     # Compute descriptor for each molecule
+    print "Computing descriptors"
     descriptors = []
     for mol in all_mols:
-        descriptors.append(SoapMol(alchem_rules, mol))
+        descriptors.append(PickableMol(SoapMol(alchem_rules, mol)))
 
     # Create kernel matrix
     N = len(all_mols)
-    kernel_matrix = np.zeros((N, N))
+    kernel_matrix = np.ones((N, N)) * np.nan
+
+    # Setup multiprocessing
+    job_queue = multiprocessing.Queue()
+    res_queue = multiprocessing.Queue()
+    num_processes = 4
+    workers = [
+            multiprocessing.Process(
+                target=worker, args=(job_queue, res_queue, alchem_rules))
+            for _ in range(num_processes)
+            ]
 
     # First compute unnormalised diagonal (used for normalisation)
     for (row, col) in zip(range(N), range(N)):
-        res = kernel(descriptors[row], descriptors[col], alchem_rules)
+        job_queue.put((row, col, descriptors[row], descriptors[col]))
+
+    # Start all workers
+    for w in workers:
+        w.start()
+
+    # Retrieve results
+    num_jobs_finished = 0
+    print "Computing diagonal"
+    while num_jobs_finished < N:
+        row, col, res = res_queue.get()
         kernel_matrix[row,col] = res
+        num_jobs_finished += 1
+    print "Done computing diagonal, joining workers"
+    for w in workers:
+        w.join()
 
     # Compute off-diagonal elements (with normalisation)
+    print "Computing off-diagonal elements"
+
+    # Create new worker processes
+    workers = [
+            multiprocessing.Process(
+                target=worker, args=(job_queue, res_queue, alchem_rules))
+            for _ in range(num_processes)
+            ]
+    # Submit jobs to queue
     for (row, col) in itertools.combinations(range(N), 2):
-        res = kernel(descriptors[row], descriptors[col], alchem_rules)
+        job_queue.put((row, col, descriptors[row], descriptors[col]))
+    # Start workers
+    for w in workers:
+        w.start()
+
+    # Retrieve results
+    num_jobs_finished = 0
+    total_jobs = len(list(itertools.combinations(range(N), 2)))
+    while num_jobs_finished < total_jobs:
+        row, col, res = res_queue.get()
         inorm = 1.0/np.sqrt(kernel_matrix[row,row]*kernel_matrix[col,col])
         kernel_matrix[row,col] = res*inorm
         kernel_matrix[col,row] = res*inorm
+        num_jobs_finished += 1
+        if (num_jobs_finished % 1000) == 0:
+            print "%s job %d/%d complete (%d%%)" %\
+                (time.strftime("%Y-%m-%d %H:%M"),
+                num_jobs_finished,
+                total_jobs,
+                100.0*float(num_jobs_finished)/float(total_jobs))
+    print "Done computing off-diagonal, joining workers"
+    for w in workers:
+        w.join()
 
     # Diagonal is normalised to unity
     kernel_matrix[np.diag_indices(N)] = 1.0
