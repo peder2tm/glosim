@@ -218,14 +218,19 @@ class SoapMol():
 
         return species, outarray
 
-def worker(job_queue, res_queue, alchem_rules):
+def worker(job_queue, res_queue, alchem_rules, descriptors):
     while 1:
-        try:
-            row, col, mola, molb = job_queue.get(True, 1)
-        except Queue.Empty:
-            return True
-        res = kernel(mola, molb, alchem_rules)
-        res_queue.put((row, col, res))
+        for row, col in job_queue.get(True):
+            if row is None or col is None:
+                return
+            mola = descriptors[row]
+            molb = descriptors[col]
+            res = kernel(mola, molb, alchem_rules)
+            res_queue.put((row, col, res))
+
+def grouper(n, iterable, padvalue=None):
+    "grouper(3, 'abcdefg', 'x') --> ('a','b','c'), ('d','e','f'), ('g','x','x')"
+    return itertools.izip_longest(*[iter(iterable)]*n, fillvalue=padvalue)
 
 def main():
     with open("alchemy.pickle","rb") as alchem_file:
@@ -254,15 +259,16 @@ def main():
     job_queue = multiprocessing.Queue()
     res_queue = multiprocessing.Queue()
     num_processes = 4
+    chunk_size = 100
     workers = [
             multiprocessing.Process(
-                target=worker, args=(job_queue, res_queue, alchem_rules))
+                target=worker, args=(job_queue, res_queue, alchem_rules, descriptors))
             for _ in range(num_processes)
             ]
 
     # First compute unnormalised diagonal (used for normalisation)
     for (row, col) in zip(range(N), range(N)):
-        job_queue.put((row, col, descriptors[row], descriptors[col]))
+        job_queue.put([(row, col),])
 
     # Start all workers
     for w in workers:
@@ -275,25 +281,13 @@ def main():
         row, col, res = res_queue.get()
         kernel_matrix[row,col] = res
         num_jobs_finished += 1
-    print "Done computing diagonal, joining workers"
-    for w in workers:
-        w.join()
 
     # Compute off-diagonal elements (with normalisation)
     print "Computing off-diagonal elements"
 
-    # Create new worker processes
-    workers = [
-            multiprocessing.Process(
-                target=worker, args=(job_queue, res_queue, alchem_rules))
-            for _ in range(num_processes)
-            ]
     # Submit jobs to queue
-    for (row, col) in itertools.combinations(range(N), 2):
-        job_queue.put((row, col, descriptors[row], descriptors[col]))
-    # Start workers
-    for w in workers:
-        w.start()
+    for chunk in grouper(chunk_size, itertools.combinations(range(N), 2), (None, None)):
+        job_queue.put(chunk)
 
     # Retrieve results
     num_jobs_finished = 0
@@ -310,16 +304,21 @@ def main():
                 num_jobs_finished,
                 total_jobs,
                 100.0*float(num_jobs_finished)/float(total_jobs))
-    print "Done computing off-diagonal, joining workers"
-    for w in workers:
-        w.join()
 
+    print "Done computing off-diagonal, saving kernel"
     # Diagonal is normalised to unity
     kernel_matrix[np.diag_indices(N)] = 1.0
 
     # Save kernel matrix to file
     with gzip.open(kernel_file, "wb") as f:
         pickle.dump(kernel_matrix, f)
+
+    print "Joining workers"
+    for w in workers:
+        job_queue.put([(None, None),])
+    for w in workers:
+        w.join()
+
 
 
 if __name__ == "__main__":
