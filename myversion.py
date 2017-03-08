@@ -192,7 +192,7 @@ class SoapMol():
             self.envs[i] *= 1.0/norm
 
     #def _get_environments(self, atoms, coff=3.0, cotw=0.5, nmax=8, lmax=6, gs=0.5, cw=1.0):
-    def _get_environments(self, atoms, coff=4.0, cotw=0.5, nmax=10, lmax=8, gs=0.5, cw=0.0):
+    def _get_environments(self, atoms, coff=3.0, cotw=0.5, nmax=12, lmax=6, gs=0.5, cw=1.0):
         """ Compute environments for each atom
         Returns tuple consisting of
         a) Dictionary giving number of atoms for a given species
@@ -218,8 +218,8 @@ class SoapMol():
 
         for sp in sorted(species.keys()):
             # Create descriptor for current species
-            #quippy_str = "soap central_weight="+str(cw)+"  covariance_sigma0=0.0 atom_sigma="+str(gs)+" cutoff="+str(coff)+" cutoff_transition_width="+str(cotw)+" n_max="+str(nmax)+" l_max="+str(lmax)+' '+lspecies+' Z='+str(sp)
-            quippy_str = "soap central_weight="+str(cw)+"  covariance_sigma0=0.0 atom_sigma="+str(gs)+" cutoff="+str(coff)+" cutoff_transition_width="+str(cotw)+" n_max="+str(nmax)+" l_max="+str(lmax)+' '+lspecies+' Z='+str(sp)+' xml_version=0'
+            quippy_str = "soap central_weight="+str(cw)+"  covariance_sigma0=0.0 atom_sigma="+str(gs)+" cutoff="+str(coff)+" cutoff_transition_width="+str(cotw)+" n_max="+str(nmax)+" l_max="+str(lmax)+' '+lspecies+' Z='+str(sp)
+            #quippy_str = "soap central_weight="+str(cw)+"  covariance_sigma0=0.0 atom_sigma="+str(gs)+" cutoff="+str(coff)+" cutoff_transition_width="+str(cotw)+" n_max="+str(nmax)+" l_max="+str(lmax)+' '+lspecies+' Z='+str(sp)+' xml_version=0'
             desc = quippy.descriptors.Descriptor(quippy_str)
 
             # Create output array
