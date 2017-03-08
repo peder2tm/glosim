@@ -300,6 +300,7 @@ def main():
 
     parser.add_argument("filename", nargs=1, help="Name of the formatted xyz input file")
     parser.add_argument("--kit", type=str, default="None", help="Dictionary-style kit specification (e.g. --kit '{4:1,6:10}' or 'auto' or 'None' (default)")
+    parser.add_argument("--continue_from", type=str, default=None, help="Load kernel and compute missing (nan) entries")
 
     args = parser.parse_args()
 
@@ -336,7 +337,14 @@ def main():
 
     # Create kernel matrix
     N = len(all_mols)
-    kernel_matrix = np.ones((N, N)) * np.nan
+    if args.continue_from is None:
+        kernel_matrix = np.ones((N, N)) * np.nan
+    else:
+        with gzip.open(args.continue_from, "rb") as f:
+            kernel_matrix = pickle.load(f)
+        assert kernel_matrix.shape == (N,N), "Can't continue, loaded kernel has wrong dimension"
+        assert not np.any(np.isnan(np.diag(kernel_matrix))), "Can't continue, diagonal has missing elements"
+        assert not np.any(np.diag(kernel_matrix) == 1.0), "Can't continue if diagonal already normalised"
 
     # Setup multiprocessing
     job_queue = multiprocessing.Queue()
@@ -354,44 +362,55 @@ def main():
             for _ in range(num_processes)
             ]
 
-    # First compute unnormalised diagonal (used for normalisation)
-    for (row, col) in zip(range(N), range(N)):
-        job_queue.put([(row, col),])
-
     # Start all workers
     for w in workers:
         w.start()
 
-    # Retrieve results
-    num_jobs_finished = 0
-    print "Computing diagonal"
-    while num_jobs_finished < N:
-        row, col, res = res_queue.get()
-        kernel_matrix[row,col] = res
-        num_jobs_finished += 1
+    # First compute unnormalised diagonal (used for normalisation)
+    if args.continue_from is None:
+        print "Computing diagonal"
+        for (row, col) in zip(range(N), range(N)):
+            job_queue.put([(row, col),])
+        # Retrieve results
+        num_jobs_finished = 0
+        while num_jobs_finished < N:
+            row, col, res = res_queue.get()
+            kernel_matrix[row,col] = res
+            num_jobs_finished += 1
+    else:
+        print "Diagonal already computed, skipping"
 
     # Compute off-diagonal elements (with normalisation)
     print "Computing off-diagonal elements"
-
     # Submit jobs to queue
-    for chunk in grouper(chunk_size, itertools.combinations(range(N), 2), (None, None)):
+    if args.continue_from is None:
+        all_jobs = list(itertools.combinations(range(N),2))
+    else:
+        unfinished = np.transpose(np.nonzero(np.isnan(kernel_matrix)))
+        all_jobs = [(row, col) for row, col in unfinished if row<col]
+
+    for chunk in grouper(chunk_size, all_jobs, (None, None)):
         job_queue.put(chunk)
 
     # Retrieve results
     num_jobs_finished = 0
-    total_jobs = len(list(itertools.combinations(range(N), 2)))
+    total_jobs = len(all_jobs)
     while num_jobs_finished < total_jobs:
         row, col, res = res_queue.get()
         inorm = 1.0/np.sqrt(kernel_matrix[row,row]*kernel_matrix[col,col])
         kernel_matrix[row,col] = res*inorm
         kernel_matrix[col,row] = res*inorm
         num_jobs_finished += 1
-        if (num_jobs_finished % 1000) == 0:
+        if (num_jobs_finished % 10000) == 0:
             print "%s job %d/%d complete (%d%%)" %\
                 (time.strftime("%Y-%m-%d %H:%M"),
                 num_jobs_finished,
                 total_jobs,
                 100.0*float(num_jobs_finished)/float(total_jobs))
+        if (num_jobs_finished % 1000000) == 0:
+            # Save kernel matrix to file
+            with gzip.open(kernel_file, "wb") as f:
+                pickle.dump(kernel_matrix, f)
 
     print "Done computing off-diagonal, saving kernel"
     # Diagonal is normalised to unity
