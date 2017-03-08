@@ -1,4 +1,6 @@
 import quippy
+import argparse
+import ast
 import time
 import os
 import numpy as np
@@ -72,6 +74,17 @@ def tensordot(arrA, arrB, alchemAB):
     dotprod = np.tensordot(dotprod, alchemAB, axes=([1,4],[0,1]))
     return np.tensordot(dotprod, alchemAB, axes=([1,3],[0,1]))
 
+def kernel_kit(a, b, alchem_mat, gamma=0.5):
+    """ Compute kernel of molecule a and b of type SoapMol,
+    using alchemical rules matrix
+    gamma is the regularisation parameter for the rematch algorithm.
+    It is assumed that we are using a kit such that a and b has the same
+    dimension and that their dimensions match with the alchemical rules matrix"""
+
+    kk = tensordot(a.envs, b.envs, alchem_mat)
+
+    return rematch(kk, gamma, 1e-6)
+
 def kernel(a, b, alchem, gamma=0.5):
     """ Compute kernel of molecule a and b of type SoapMol,
     using alchemical rules alchem
@@ -109,18 +122,14 @@ def kernel(a, b, alchem, gamma=0.5):
         sp_idx, atm_idx = idx_to_spec[env_idx]
         # Missing atoms are set to isolated species
         # TODO: Not sure why we set them to 1?
-        #arrA[env_idx, sp_idx, sp_idx, 0] = 1
-        #arrB[env_idx, sp_idx, sp_idx, 0] = 1
+        arrA[env_idx, sp_idx, sp_idx, 0] = 1
+        arrB[env_idx, sp_idx, sp_idx, 0] = 1
 
     map_array(a.envs, arrA, a.species, union_species)
     map_array(b.envs, arrB, b.species, union_species)
 
     # alchemical matrix for species
-    alchemAB = np.zeros((nsp,nsp), float)
-    for sA in xrange(nsp):
-        for sB in xrange(sA+1):
-            alchemAB[sA,sB] = alchem[(zspecies[sA],zspecies[sB])]
-            alchemAB[sB,sA] = alchemAB[sA,sB]
+    alchemAB = get_alchem_mat(alchem, union_species)
 
     kk = tensordot(arrA, arrB, alchemAB)
 
@@ -128,31 +137,53 @@ def kernel(a, b, alchem, gamma=0.5):
 
 class PickableMol():
     """ Contains the necessary attributes from SoapMol to compute kernel.
-        This object must be pickable to be sent through the multiprocessing
-        queue. """
+        This object must be pickable to be transferred to another process. """
     def __init__(self, soapmol):
         self.species = soapmol.species
         self.envs = soapmol.envs
 
 class SoapMol():
-    def __init__(self, alchem_rules, atoms):
+    def __init__(self, alchem_rules, atoms, kit=None):
         self.alchem_rules = alchem_rules
         self.species, self.envs = self._get_environments(atoms)
+
+        if kit is not None:
+            self.species, self.envs = self._kit_expand(kit)
+
         self._normalise()
 
         assert sum(self.species.values()) == self.envs.shape[0]
+
+    def _kit_expand(self, kit):
+        """ Expand molecule with isolated species as specified by kit """
+
+        # Sorted list of species
+        zspecies = sorted(kit.keys())
+        nsp = len(zspecies) # Shorthand for number of species
+        nenv = sum(kit.values())
+
+        # Make a mapping from atom idx to (species, species_atom_idx)
+        nspecies = [(i, kit[z]) for i,z in enumerate(zspecies)]
+        idx_to_spec = [zip([i]*nz,range(nz)) for i, nz in nspecies]
+        idx_to_spec = [itm for sublist in idx_to_spec for itm in sublist]
+
+        flen = self.envs.shape[3] # Length of vector of Power Spectrum coefficients
+        new_envs = np.zeros((nenv, nsp, nsp, flen), dtype=float)
+        for env_idx in range(nenv):
+            sp_idx, atm_idx = idx_to_spec[env_idx]
+            # Missing atoms are set to isolated species
+            # TODO: Not sure why we set them to 1?
+            new_envs[env_idx, sp_idx, sp_idx, 0] = 1
+
+        map_array(self.envs, new_envs, self.species, kit)
+
+        return kit, new_envs
 
     def _normalise(self):
         """ Normalise each local environment such that the kernel
         with a single environment with itself is unity """
         # alchemical matrix for species
-        nsp = len(self.species.keys())
-        zspecies = sorted(self.species.keys())
-        alchemAB = np.zeros((nsp,nsp), float)
-        for sA in xrange(nsp):
-            for sB in xrange(sA+1):
-                alchemAB[sA,sB] = self.alchem_rules[(zspecies[sA],zspecies[sB])]
-                alchemAB[sB,sA] = alchemAB[sA,sB]
+        alchemAB = get_alchem_mat(self.alchem_rules, self.species)
 
         for i in range(self.envs.shape[0]):
             norm = np.tensordot(self.envs[i], self.envs[i], axes=([2],[2]))
@@ -207,6 +238,8 @@ class SoapMol():
             # n2 is the index of spherical harmonics basis [0:nmax-1] if s2<s1, else [0:n1]
             # l  is the index of spherical harmonics basis [0:lmax]
             #   when s1=s2 the power spectrum is half as long
+            # The call to convert reshapes the quippy format to
+            # (nspecies, nspecies, nmax**2*(lmax+1))
             psp = np.array(psp.T)
             for soap in psp:
                 env_list.append(convert(nmax, lmax, len(species.keys()), soap))
@@ -218,38 +251,88 @@ class SoapMol():
 
         return species, outarray
 
-def worker(job_queue, res_queue, alchem_rules, descriptors):
+def get_alchem_mat(alchem_rules, species):
+    # alchemical matrix for species
+    zspecies = sorted(species.keys())
+    nsp = len(zspecies)
+    alchemAB = np.zeros((nsp,nsp), float)
+    for sA in xrange(nsp):
+        for sB in xrange(sA+1):
+            alchemAB[sA,sB] = alchem_rules[(zspecies[sA],zspecies[sB])]
+            alchemAB[sB,sA] = alchemAB[sA,sB]
+    return alchemAB
+
+
+def worker(job_queue, res_queue, alchem, descriptors, usekit):
     while 1:
         for row, col in job_queue.get(True):
             if row is None or col is None:
                 return
             mola = descriptors[row]
             molb = descriptors[col]
-            res = kernel(mola, molb, alchem_rules)
+            if usekit:
+                res = kernel_kit(mola, molb, alchem)
+            else:
+                res = kernel(mola, molb, alchem)
             res_queue.put((row, col, res))
 
 def grouper(n, iterable, padvalue=None):
     "grouper(3, 'abcdefg', 'x') --> ('a','b','c'), ('d','e','f'), ('g','x','x')"
     return itertools.izip_longest(*[iter(iterable)]*n, fillvalue=padvalue)
 
+def getkit(mols):
+    """ Loops over iterable of molecules and returns dictionary giving
+        the maximum number of atoms for each species """
+    kit = {}
+    for mol in mols:
+        species = dict([(i,len(list(j))) for (i,j) in itertools.groupby(sorted(mol.z))])
+        for key, val in species.items():
+            if key in kit:
+                kit[key] = max(val, kit[key])
+            else:
+                kit[key] = val
+
+    return kit
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="""Computes the similarity matrix between a set of atomic structures based on SOAP descriptors and an optimal assignment of local environments.""")
+
+    parser.add_argument("filename", nargs=1, help="Name of the formatted xyz input file")
+    parser.add_argument("--kit", type=str, default="None", help="Dictionary-style kit specification (e.g. --kit '{4:1,6:10}' or 'auto' or 'None' (default)")
+
+    args = parser.parse_args()
+
+
     with open("alchemy.pickle","rb") as alchem_file:
         alchem_rules = pickle.load(alchem_file)
     #from collections import defaultdict
     #alchem_rules = defaultdict(lambda: 1) # TODO: WARNING. Using 1 as alchem rule
     #print "ALCHEM RULES ARE 1"
 
-    xyz_file = sys.argv[1]
+    xyz_file = args.filename[0]
     kernel_file = os.path.splitext(xyz_file)[0] + ".k.pkz"
 
     # Load xyz file with molecules and convert to quippy format
     all_mols = quippy.AtomsList(xyz_file)
 
+    # Determine kit to use
+    kitstr = args.kit
+    if kitstr == "auto":
+        kit = getkit(all_mols)
+        print "Using kit %s" % kit
+    elif kitstr != "None" and kitstr != "none":
+        kit = ast.literal_eval(str(args.kit))
+        print "Using kit %s" % kit
+    else:
+        kit = None
+
+
     # Compute descriptor for each molecule
     print "Computing descriptors"
     descriptors = []
     for mol in all_mols:
-        descriptors.append(PickableMol(SoapMol(alchem_rules, mol)))
+        descriptors.append(PickableMol(SoapMol(alchem_rules, mol, kit = kit)))
 
     # Create kernel matrix
     N = len(all_mols)
@@ -260,9 +343,14 @@ def main():
     res_queue = multiprocessing.Queue()
     num_processes = 4
     chunk_size = 100
+    usekit = (kit is not None)
+    if usekit:
+        alchem = get_alchem_mat(alchem_rules, kit)
+    else:
+        alchem = alchem_rules
     workers = [
             multiprocessing.Process(
-                target=worker, args=(job_queue, res_queue, alchem_rules, descriptors))
+                target=worker, args=(job_queue, res_queue, alchem, descriptors, usekit)) \
             for _ in range(num_processes)
             ]
 
